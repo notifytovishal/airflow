@@ -2,7 +2,6 @@ from __future__ import print_function
 
 import doctest
 import json
-import logging
 import os
 import re
 import unittest
@@ -22,14 +21,17 @@ from airflow.executors import SequentialExecutor, LocalExecutor
 from airflow.models import Variable
 
 configuration.test_mode()
-from airflow import jobs, models, DAG, utils, operators, hooks, macros, settings
+from airflow import jobs, models, DAG, utils, operators, hooks, macros, settings, exceptions
 from airflow.hooks import BaseHook
 from airflow.bin import cli
 from airflow.www import app as application
 from airflow.settings import Session
-from airflow.utils import LoggingMixin, round_time
+from airflow.utils.state import State
+from airflow.utils.dates import round_time
+from airflow.utils.logging import LoggingMixin
+from airflow.utils import email as email_utils
 from lxml import html
-from airflow.utils import AirflowException
+from airflow.exceptions import AirflowException
 from airflow.configuration import AirflowConfigException
 from airflow.minihivecluster import MiniHiveCluster
 
@@ -121,7 +123,7 @@ class CoreTest(unittest.TestCase):
         assert dag_run.execution_date == datetime(2015, 1, 2, 0, 0), (
             'dag_run.execution_date did not match expectation: {0}'
                 .format(dag_run.execution_date))
-        assert dag_run.state == models.State.RUNNING
+        assert dag_run.state == State.RUNNING
         assert dag_run.external_trigger == False
 
     def test_schedule_dag_fake_scheduled_previous(self):
@@ -141,7 +143,7 @@ class CoreTest(unittest.TestCase):
             dag_id=dag.dag_id,
             run_id=models.DagRun.id_for_date(DEFAULT_DATE),
             execution_date=DEFAULT_DATE,
-            state=utils.State.SUCCESS,
+            state=State.SUCCESS,
             external_trigger=True)
         settings.Session().add(trigger)
         settings.Session().commit()
@@ -153,7 +155,7 @@ class CoreTest(unittest.TestCase):
         assert dag_run.execution_date == DEFAULT_DATE + delta, (
             'dag_run.execution_date did not match expectation: {0}'
                 .format(dag_run.execution_date))
-        assert dag_run.state == models.State.RUNNING
+        assert dag_run.state == State.RUNNING
         assert dag_run.external_trigger == False
 
     def test_schedule_dag_once(self):
@@ -239,7 +241,7 @@ class CoreTest(unittest.TestCase):
             dag_runs.append(dag_run)
 
             # Mark the DagRun as complete
-            dag_run.state = utils.State.SUCCESS
+            dag_run.state = State.SUCCESS
             session.merge(dag_run)
             session.commit()
 
@@ -461,7 +463,7 @@ class CoreTest(unittest.TestCase):
             python_callable=lambda: sleep(5),
             dag=self.dag)
         self.assertRaises(
-            utils.AirflowTaskTimeout,
+            exceptions.AirflowTaskTimeout,
             t.run,
             start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
@@ -1255,7 +1257,7 @@ class WebHdfsSensorTest(unittest.TestCase):
 class ConnectionTest(unittest.TestCase):
     def setUp(self):
         configuration.test_mode()
-        utils.initdb()
+        utils.db.initdb()
         os.environ['AIRFLOW_CONN_TEST_URI'] = (
             'postgres://username:password@ec2.compute.com:5432/the_database')
         os.environ['AIRFLOW_CONN_TEST_URI_NO_CREDS'] = (
@@ -1396,16 +1398,16 @@ class EmailTest(unittest.TestCase):
     def setUp(self):
         configuration.remove_option('email', 'EMAIL_BACKEND')
 
-    @mock.patch('airflow.utils.send_email_smtp')
+    @mock.patch('email_utils.send_email_smtp')
     def test_default_backend(self, mock_send_email):
-        res = utils.send_email('to', 'subject', 'content')
+        res = email_utils.send_email('to', 'subject', 'content')
         mock_send_email.assert_called_with('to', 'subject', 'content', files=None, dryrun=False)
         assert res == mock_send_email.return_value
 
-    @mock.patch('airflow.utils.send_email_smtp')
+    @mock.patch('email_utils.send_email_smtp')
     def test_custom_backend(self, mock_send_email):
         configuration.set('email', 'EMAIL_BACKEND', 'tests.core.send_email_test')
-        utils.send_email('to', 'subject', 'content')
+        email_utils.send_email('to', 'subject', 'content')
         send_email_test.assert_called_with('to', 'subject', 'content', files=None, dryrun=False)
         assert not mock_send_email.called
 
@@ -1414,12 +1416,12 @@ class EmailSmtpTest(unittest.TestCase):
     def setUp(self):
         configuration.set('smtp', 'SMTP_SSL', 'False')
 
-    @mock.patch('airflow.utils.send_MIME_email')
+    @mock.patch('email_utils.send_MIME_email')
     def test_send_smtp(self, mock_send_mime):
         attachment = tempfile.NamedTemporaryFile()
         attachment.write(b'attachment')
         attachment.seek(0)
-        utils.send_email_smtp('to', 'subject', 'content', files=[attachment.name])
+        email_utils.send_email_smtp('to', 'subject', 'content', files=[attachment.name])
         assert mock_send_mime.called
         call_args = mock_send_mime.call_args[0]
         assert call_args[0] == configuration.get('smtp', 'SMTP_MAIL_FROM')
@@ -1437,7 +1439,7 @@ class EmailSmtpTest(unittest.TestCase):
         mock_smtp.return_value = mock.Mock()
         mock_smtp_ssl.return_value = mock.Mock()
         msg = MIMEMultipart()
-        utils.send_MIME_email('from', 'to', msg, dryrun=False)
+        email_utils.send_MIME_email('from', 'to', msg, dryrun=False)
         mock_smtp.assert_called_with(
             configuration.get('smtp', 'SMTP_HOST'),
             configuration.getint('smtp', 'SMTP_PORT'),
@@ -1456,7 +1458,7 @@ class EmailSmtpTest(unittest.TestCase):
         configuration.set('smtp', 'SMTP_SSL', 'True')
         mock_smtp.return_value = mock.Mock()
         mock_smtp_ssl.return_value = mock.Mock()
-        utils.send_MIME_email('from', 'to', MIMEMultipart(), dryrun=False)
+        email_utils.send_MIME_email('from', 'to', MIMEMultipart(), dryrun=False)
         assert not mock_smtp.called
         mock_smtp_ssl.assert_called_with(
             configuration.get('smtp', 'SMTP_HOST'),
@@ -1466,7 +1468,7 @@ class EmailSmtpTest(unittest.TestCase):
     @mock.patch('smtplib.SMTP_SSL')
     @mock.patch('smtplib.SMTP')
     def test_send_mime_dryrun(self, mock_smtp, mock_smtp_ssl):
-        utils.send_MIME_email('from', 'to', MIMEMultipart(), dryrun=True)
+        email_utils.send_MIME_email('from', 'to', MIMEMultipart(), dryrun=True)
         assert not mock_smtp.called
         assert not mock_smtp_ssl.called
 
